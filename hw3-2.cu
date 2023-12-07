@@ -9,39 +9,10 @@
 #define INF 1073741823
 
 // const int bs = 512;
-#define bs 512
+#define bs 64
 // const int num_threads = 16; // 調整為您需要的數量
 
-__global__ void block_fw_kernel(int* dist1, int* dist2, int* dist3, int block_h, int block_w, int num_vertices) {
-    int kn, in, tmp;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (i < block_h && j < block_w) {
-        kn = threadIdx.z * num_vertices;
-        in = i * num_vertices;
-        tmp = dist2[in + threadIdx.z] + dist3[kn + j];
-
-        if (dist1[in + j] > tmp)
-            dist1[in + j] = tmp;
-    }
-}
-
-__global__ void block_fw_p3_kernel(int* dist1, int* dist2, int* dist3, int block_h, int block_w, int num_vertices) {
-    int kn, in, tmp;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = threadIdx.z;
-
-    if (i < block_h && j < block_w && k < num_vertices) {
-        kn = k * num_vertices;
-        in = i * num_vertices;
-        tmp = dist2[in + k] + dist3[kn + j];
-
-        if (dist1[in + j] > tmp)
-            dist1[in + j] = tmp;
-    }
-}
 
 __global__ void block_fw_p1_kernel(int* dist1, int k, int num_vertices)
 {
@@ -113,11 +84,11 @@ __global__ void block_fw_p2_kernel(int* dist1, int k, int num_vertices)
 }
 
 __global__ void block_fw_p3_kernel(int* dist1, int k, int num_vertices){
-    if(i==k||j==k)
+    if(blockIdx.x==k||blockIdx.y==k)
         return;
-    __shared__ shared_block_ij[bs*bs];
-    __shared__ shared_block_ik[bs*bs];
-    __shared__ shared_block_kj[bs*bs];
+    __shared__ int shared_block_ij[bs*bs];
+    __shared__ int shared_block_ik[bs*bs];
+    __shared__ int shared_block_kj[bs*bs];
     __syncthreads();
     int x_shift_i = blockIdx.y * bs * num_vertices;
     int x_shift_k = k * bs * num_vertices;
@@ -187,7 +158,7 @@ void writeBinaryFile(char* FileName, int* dist, int n) {
             if (dist[i*n+j] >= INF) 
                 dist[i*n+j] = INF;
         }
-        fwrite(dist[i], sizeof(int), n, outfile); 
+        fwrite(dist+i*n, sizeof(int), n, outfile); 
     }
     // std::cout<<"hi"<<std::endl;
     // fwrite(dist, sizeof(int), n*n, outfile);
@@ -212,9 +183,9 @@ int main(int argc, char* argv[]) {
 
 
     for (int k = 0; k < round; k++) {
-        block_fw_p1_kernel<<1, blockSize>>(d_dist, k, pad_vertices);
-        block_fw_p2_kernel<<round, blockSize>>(d_dist, k, pad_vertices);
-        block_fw_p3_kernel<<gridSize, blockSize>>(d_dist, k, pad_vertices);
+        block_fw_p1_kernel<<<1, blockSize>>>(d_dist, k, pad_vertices);
+        block_fw_p2_kernel<<<round, blockSize>>>(d_dist, k, pad_vertices);
+        block_fw_p3_kernel<<<gridSize, blockSize>>>(d_dist, k, pad_vertices);
     }
 
     cudaMemcpy(dist, d_dist, pad_vertices * pad_vertices * sizeof(int), cudaMemcpyDeviceToHost);
