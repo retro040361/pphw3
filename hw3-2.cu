@@ -7,218 +7,191 @@
 #include <iostream>
 #include <cuda.h>
 
-#define INF 99999
+#define INF 1073741823
 
 // static int bs = 64;
 #define BLOCK_DIM 16
-#define bs 16
+#define bs 64
 #define BLOCK_SIZE 64
-#define HALF_BLOCK_FACTOR 64
-// const int num_threads = 16; // 調整為您需要的數量
+#define HALF_BLOCK_FACTOR 32
+
+using namespace std;
+
 __forceinline__
-__device__ void block_calc(int* C, int* A, int* B, int bi, int bj) {
-  for (int k = 0; k < bs; k++) {
-    int sum = A[bi*bs + k] + B[k*bs + bj];
-    if (C[bi*bs + bj] > sum) {
-      C[bi*bs + bj] = sum;
-    }
-    __syncthreads();
-  }
-  
-}
-
-__global__ void floyd_warshall_block_kernel_phase1(int n, int k, int* graph) {
-  const unsigned int bi = threadIdx.y;
-  const unsigned int bj = threadIdx.x;
-
-  __shared__ int C[BLOCK_DIM * BLOCK_DIM];
-
-  __syncthreads();
-
-  // Transfer to temp shared arrays
-  C[bi*BLOCK_DIM + bj] = graph[k*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj];
-
-  __syncthreads();
-  
-  block_calc(C, C, C, bi, bj);
-
-  __syncthreads();
-
-  // Transfer back to graph
-  graph[k*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj] = C[bi*BLOCK_DIM + bj];
-
-}
-
-
-__global__ void floyd_warshall_block_kernel_phase2(int n, int k, int* graph) {
-  // BlockDim is one dimensional (Straight along diagonal)
-  // Blocks themselves are two dimensional
-  const unsigned int i = blockIdx.x;
-  const unsigned int bi = threadIdx.y;
-  const unsigned int bj = threadIdx.x;
-
-  if (i == k) return;
-
-  __shared__ int A[BLOCK_DIM * BLOCK_DIM];
-  __shared__ int B[BLOCK_DIM * BLOCK_DIM];
-  __shared__ int C[BLOCK_DIM * BLOCK_DIM];
-
-  __syncthreads();
-
-  C[bi*BLOCK_DIM + bj] = graph[i*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj];
-  B[bi*BLOCK_DIM + bj] = graph[k*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj];
-
-  __syncthreads();
-
-  block_calc(C, C, B, bi, bj);
-
-  __syncthreads();
-
-  graph[i*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj] = C[bi*BLOCK_DIM + bj];
-
-  // Phase 2 1/2
-
-  C[bi*BLOCK_DIM + bj] = graph[k*BLOCK_DIM*n + i*BLOCK_DIM + bi*n + bj];
-  A[bi*BLOCK_DIM + bj] = graph[k*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj];
-
-  __syncthreads();
-
-  block_calc(C, A, C, bi, bj);
-
-  __syncthreads();
-
-  // Block C is the only one that could be changed
-  graph[k*BLOCK_DIM*n + i*BLOCK_DIM + bi*n + bj] = C[bi*BLOCK_DIM + bj];
-}
-
-
-__global__ void floyd_warshall_block_kernel_phase3(int n, int k, int* graph) {
-  // BlockDim is one dimensional (Straight along diagonal)
-  // Blocks themselves are two dimensional
-  const unsigned int j = blockIdx.x;
-  const unsigned int i = blockIdx.y;
-  const unsigned int bi = threadIdx.y;
-  const unsigned int bj = threadIdx.x;
-
-  if (i == k && j == k) return;
-  __shared__ int A[BLOCK_DIM * BLOCK_DIM];
-  __shared__ int B[BLOCK_DIM * BLOCK_DIM];
-  __shared__ int C[BLOCK_DIM * BLOCK_DIM];
-
-  __syncthreads();
-
-  C[bi*BLOCK_DIM + bj] = graph[i*BLOCK_DIM*n + j*BLOCK_DIM + bi*n + bj];
-  A[bi*BLOCK_DIM + bj] = graph[i*BLOCK_DIM*n + k*BLOCK_DIM + bi*n + bj];
-  B[bi*BLOCK_DIM + bj] = graph[k*BLOCK_DIM*n + j*BLOCK_DIM + bi*n + bj];
-
-  __syncthreads();
-
-  block_calc(C, A, B, bi, bj);
-
-  __syncthreads();
-
-  graph[i*BLOCK_DIM*n + j*BLOCK_DIM + bi*n + bj] = C[bi*BLOCK_DIM + bj];
+__device__ void update(int* C, int* A, int* B){
+    int tmp = A[0]+B[0]; 
+    if(C[0]>tmp)
+        C[0] = tmp;
 }
 
 __global__ void block_fw_p1_kernel(int* dist1, int k, int num_vertices)
 {
-    __shared__ int shared_block[bs*bs];
-    __syncthreads();
+    __shared__ int shared_block[bs][bs];  // 添加一列 padding，避免 bank conflicts
+
+    int x_shift = k * bs * num_vertices;
+
+    int tidy = threadIdx.y , tidy_32 = (threadIdx.y + 32);
+    int tidy_n = threadIdx.y * num_vertices, tidy_n_32 = (threadIdx.y + 32) * num_vertices;
+    int tidx = threadIdx.x, tidx_32 = threadIdx.x + 32;
+    int kbs = k * bs; 
+
+    shared_block[tidy][tidx] = dist1[x_shift + kbs + tidy_n + tidx];
+    shared_block[tidy_32][tidx] = dist1[x_shift + kbs + tidy_n_32 + tidx];
+    shared_block[tidy][tidx_32] = dist1[x_shift + kbs + tidy_n + tidx_32];
     
-    int x_shift = k*bs;
-    int y_shift = k*bs + threadIdx.y * num_vertices + threadIdx.x;  //
-    shared_block[threadIdx.y*bs + threadIdx.x] = dist1[x_shift*num_vertices + y_shift];
+    shared_block[tidy_32][tidx_32] = dist1[x_shift + kbs + tidy_n_32 + tidx_32];
     __syncthreads();
-    block_calc(shared_block,shared_block,shared_block,threadIdx.y,threadIdx.x);
-    // int tmp;
-    // for(int kk=0;kk<bs;kk++){
-    //     tmp = shared_block[threadIdx.x*bs + kk] + shared_block[kk*bs + threadIdx.y];  
-    //     if(tmp < shared_block[threadIdx.x*bs + threadIdx.y])
-    //         shared_block[threadIdx.x*bs + threadIdx.y] = tmp;
-    //     __syncthreads();
-    // }
-    __syncthreads();
-    dist1[x_shift*num_vertices + y_shift] = shared_block[threadIdx.y*bs + threadIdx.x];
+
+    for (int kk = 0; kk < bs; kk++) {
+        shared_block[tidy][tidx] = min(shared_block[tidy][tidx], shared_block[tidy][kk] + shared_block[kk][tidx]);
+        shared_block[tidy][tidx_32] = min(shared_block[tidy][tidx_32], shared_block[tidy][kk] + shared_block[kk][tidx_32]);
+        shared_block[tidy_32][tidx] = min(shared_block[tidy_32][tidx], shared_block[tidy_32][kk] + shared_block[kk][tidx]);
+        shared_block[tidy_32][tidx_32] = min(shared_block[tidy_32][tidx_32], shared_block[tidy_32][kk] + shared_block[kk][tidx_32]);
+        // update(&shared_block[tidy][tidx], &shared_block[tidy][kk], &shared_block[kk][tidx]);
+        // update(&shared_block[tidy_32][tidx], &shared_block[tidy_32][kk], &shared_block[kk][tidx]);
+        // update(&shared_block[tidy][tidx_32], &shared_block[tidy][kk], &shared_block[kk][tidx_32]);
+        
+        // update(&shared_block[tidy_32][tidx_32], &shared_block[tidy_32][kk], &shared_block[kk][tidx_32]);
+
+        __syncthreads();
+    }
+    // __syncthreads();
+    dist1[x_shift + kbs + tidy_n + tidx] = shared_block[tidy][tidx];
+    dist1[x_shift + kbs + tidy_n_32 + tidx] = shared_block[tidy_32][tidx];
+    dist1[x_shift + kbs + tidy_n + tidx_32] = shared_block[tidy][tidx_32];
+    
+    dist1[x_shift + kbs + tidy_n_32 + tidx_32] = shared_block[tidy_32][tidx_32];
 }
 
 __global__ void block_fw_p2_kernel(int* dist1, int k, int num_vertices)
 {
-    if(blockDim.x == k)
+    if(blockIdx.x == k)
         return;
-    __shared__ int shared_block_ik[bs*bs];
-    __shared__ int shared_block_kk[bs*bs];
+
+    __shared__ int shared_block_ik[bs][bs];
+    __shared__ int shared_block_kk[bs][bs];
+    __shared__ int shared_block_ki[bs][bs];
     __syncthreads();
     
     int x_shift_kk = k * bs * num_vertices;
-    int y_shift = k * bs + threadIdx.y * num_vertices + threadIdx.x;  
     int x_shift_ik = blockIdx.x * bs * num_vertices;
-    // int y_shift_ik = k * bs + threadIdx.y * num_vertices + threadIdx.x;  
-    
-    shared_block_kk[threadIdx.y*bs + threadIdx.x] = dist1[x_shift_kk + y_shift];    // B
-    shared_block_ik[threadIdx.y*bs + threadIdx.x] = dist1[x_shift_ik + y_shift];    // C
-    
-    __syncthreads();
-    block_calc(shared_block_ik,shared_block_ik,shared_block_kk,threadIdx.y,threadIdx.x);
-    // int tmp;
-    // for(int kk=0;kk<bs;kk++){
-    //     tmp = shared_block_ik[threadIdx.y*bs + kk] + shared_block_kk[kk*bs + threadIdx.x];  
-    //     if(tmp < shared_block_ik[threadIdx.y*bs + threadIdx.x])
-    //         shared_block_ik[threadIdx.y*bs + threadIdx.x] = tmp;
-    //     __syncthreads();
-    // }
-    __syncthreads();
-    dist1[x_shift_ik + y_shift] = shared_block_ik[threadIdx.y*bs + threadIdx.x];
 
-    __shared__ int shared_block_nkk[bs*bs];  // 
-    // int x_shift = k * bs * num_vertices;
-    int y_shift_ki = blockIdx.x * bs + threadIdx.y * num_vertices + threadIdx.x;  
-    int y_shift_kk = k * bs + threadIdx.y * num_vertices + threadIdx.x;
-    // int y_shift_ik = k * bs + threadIdx.y * num_vertices + threadIdx.x;  
+    int tidy = (threadIdx.y), tidy_32 = (threadIdx.y+32);
+    int tidy_n = (threadIdx.y)*num_vertices, tidy_n_32 = (threadIdx.y+32)*num_vertices;
+    int tidx = threadIdx.x, tidx_32 = threadIdx.x + 32;
+    int kbs = k*bs, bbs = blockIdx.x * bs;    
+
+    shared_block_kk[tidy][tidx] = dist1[x_shift_kk + kbs + tidy_n + tidx];
+    shared_block_kk[tidy_32][tidx] = dist1[x_shift_kk + kbs + tidy_n_32 + tidx];
+    shared_block_kk[tidy][tidx_32] = dist1[x_shift_kk + kbs + tidy_n + tidx_32];
     
-    shared_block_nkk[threadIdx.y*bs + threadIdx.x] = dist1[x_shift_kk + y_shift_kk];    // A
-    shared_block_ik[threadIdx.y*bs + threadIdx.x] = dist1[x_shift_kk + y_shift_ki];     // C
+    shared_block_kk[tidy_32][tidx_32] = dist1[x_shift_kk + kbs + tidy_n_32 + tidx_32];
+
+    shared_block_ik[tidy][threadIdx.x] = dist1[x_shift_ik + kbs + tidy_n + threadIdx.x];    
+    shared_block_ik[tidy_32][threadIdx.x] = dist1[x_shift_ik + kbs + tidy_n_32 + threadIdx.x]; 
+    shared_block_ik[tidy][threadIdx.x+32] = dist1[x_shift_ik + kbs + tidy_n + threadIdx.x+32];    
+       
+    shared_block_ik[tidy_32][threadIdx.x+32] = dist1[x_shift_ik + kbs + tidy_n_32 + threadIdx.x+32];    
+
+    shared_block_ki[tidy][threadIdx.x] = dist1[x_shift_kk + bbs + tidy_n + threadIdx.x];
+    shared_block_ki[tidy_32][threadIdx.x] = dist1[x_shift_kk + bbs + tidy_n_32 + threadIdx.x];
+    shared_block_ki[tidy][threadIdx.x+32] = dist1[x_shift_kk + bbs + tidy_n + threadIdx.x+32];
     
+    shared_block_ki[tidy_32][threadIdx.x+32] = dist1[x_shift_kk + bbs + tidy_n_32 + threadIdx.x+32];    
+
     __syncthreads();
-    // int tmp;
-    block_calc(shared_block_ik,shared_block_nkk,shared_block_ik,threadIdx.y,threadIdx.x);
-    // for(int kk=0;kk<bs;kk++){
-    //     tmp = shared_block_nkk[threadIdx.y*bs + kk] + shared_block_ik[kk*bs + threadIdx.x];  
-    //     if(tmp < shared_block_ik[threadIdx.y*bs + threadIdx.x])
-    //         shared_block_ik[threadIdx.y*bs + threadIdx.x] = tmp;
-    //     __syncthreads();
-    // }
-    __syncthreads();
-    dist1[x_shift_kk + y_shift_ki] = shared_block_ik[threadIdx.y*bs + threadIdx.x];
+
+    
+    for(int kk=0;kk<bs;kk++){
+        shared_block_ik[tidy][threadIdx.x] = min(shared_block_ik[tidy][threadIdx.x], shared_block_ik[tidy][kk] + shared_block_kk[kk][threadIdx.x]);
+        shared_block_ik[tidy_32][threadIdx.x] = min(shared_block_ik[tidy_32][threadIdx.x], shared_block_ik[tidy_32][kk] + shared_block_kk[kk][threadIdx.x]);
+        shared_block_ik[tidy][threadIdx.x+32] = min(shared_block_ik[tidy][threadIdx.x+32], shared_block_ik[tidy][kk] + shared_block_kk[kk][tidx_32]);
+        shared_block_ik[tidy_32][threadIdx.x+32] = min(shared_block_ik[tidy_32][threadIdx.x+32], shared_block_ik[tidy_32][kk] + shared_block_kk[kk][tidx_32]);
+        // update(&shared_block_ik[tidy][threadIdx.x], &shared_block_ik[tidy][kk], &shared_block_kk[kk][threadIdx.x]);
+        // update(&shared_block_ik[tidy_32][threadIdx.x], &shared_block_ik[tidy_32][kk], &shared_block_kk[kk][threadIdx.x]);
+        // update(&shared_block_ik[tidy][threadIdx.x+32], &shared_block_ik[tidy][kk], &shared_block_kk[kk][tidx_32]);
+        // update(&shared_block_ik[tidy_32][threadIdx.x+32], &shared_block_ik[tidy_32][kk], &shared_block_kk[kk][tidx_32]);
+
+        shared_block_ki[tidy][threadIdx.x] = min(shared_block_ki[tidy][threadIdx.x], shared_block_kk[tidy][kk] + shared_block_ki[kk][threadIdx.x]);
+        shared_block_ki[tidy_32][threadIdx.x] = min(shared_block_ki[tidy_32][threadIdx.x], shared_block_kk[tidy_32][kk] + shared_block_ki[kk][threadIdx.x]);
+        shared_block_ki[tidy][threadIdx.x+32] = min(shared_block_ki[tidy][threadIdx.x+32], shared_block_kk[tidy][kk] + shared_block_ki[kk][tidx_32]);        
+        shared_block_ki[tidy_32][threadIdx.x+32] = min(shared_block_ki[tidy_32][threadIdx.x+32], shared_block_kk[tidy_32][kk] + shared_block_ki[kk][tidx_32]);
+        
+        // update(&shared_block_ki[tidy][threadIdx.x], &shared_block_kk[tidy][kk], &shared_block_ki[kk][threadIdx.x]);
+        // update(&shared_block_ki[tidy_32][threadIdx.x], &shared_block_kk[tidy_32][kk], &shared_block_ki[kk][threadIdx.x]);
+        // update(&shared_block_ki[tidy][threadIdx.x+32], &shared_block_kk[tidy][kk], &shared_block_ki[kk][tidx_32]);        
+        // update(&shared_block_ki[tidy_32][threadIdx.x+32], &shared_block_kk[tidy_32][kk], &shared_block_ki[kk][tidx_32]);
+    }
+
+    dist1[x_shift_ik + kbs + tidy_n + threadIdx.x] = shared_block_ik[tidy][threadIdx.x];    
+    dist1[x_shift_ik + kbs + tidy_n_32 + threadIdx.x] = shared_block_ik[tidy_32][threadIdx.x];    
+    dist1[x_shift_ik + kbs + tidy_n + threadIdx.x+32] = shared_block_ik[tidy][threadIdx.x+32];    
+    
+    dist1[x_shift_ik + kbs + tidy_n_32 + threadIdx.x+32] = shared_block_ik[tidy_32][threadIdx.x+32];    
+
+    dist1[x_shift_kk + bbs + tidy_n + threadIdx.x] = shared_block_ki[tidy][threadIdx.x];
+    dist1[x_shift_kk + bbs + tidy_n_32 + threadIdx.x] = shared_block_ki[tidy_32][threadIdx.x];
+    dist1[x_shift_kk + bbs + tidy_n + threadIdx.x+32] = shared_block_ki[tidy][threadIdx.x+32];
+    
+    dist1[x_shift_kk + bbs + tidy_n_32 + threadIdx.x+32] = shared_block_ki[tidy_32][threadIdx.x+32]; 
 
 }
 
 __global__ void block_fw_p3_kernel(int* dist1, int k, int num_vertices){
     if(blockIdx.x==k&&blockIdx.y==k)
         return;
-    __shared__ int shared_block_ij[bs*bs];  // C
-    __shared__ int shared_block_ik[bs*bs];  // A
-    __shared__ int shared_block_kj[bs*bs];  // B
+
+    __shared__ int shared_block_ij[bs][bs];  // C
+    __shared__ int shared_block_ik[bs][bs];  // A
+    __shared__ int shared_block_kj[bs][bs];  // B
     __syncthreads();
+
     int x_shift_i = blockIdx.y * bs * num_vertices;
     int x_shift_k = k * bs * num_vertices;
-    int y_shift_j = blockIdx.x * bs + threadIdx.y * num_vertices + threadIdx.x;
-    int y_shift_k = k * bs + threadIdx.y * num_vertices + threadIdx.x;
-    shared_block_ij[threadIdx.y * bs + threadIdx.x] = dist1[x_shift_i + y_shift_j];
-    shared_block_ik[threadIdx.y * bs + threadIdx.x] = dist1[x_shift_i + y_shift_k];
-    shared_block_kj[threadIdx.y * bs + threadIdx.x] = dist1[x_shift_k + y_shift_j];
+
+    int tidy = (threadIdx.y), tidy_32 = (threadIdx.y+32);
+    int tidy_n = (threadIdx.y)*num_vertices, tidy_n_32 = (threadIdx.y+32)*num_vertices;
+    int tidx = threadIdx.x, tidx_32 = threadIdx.x + 32;
+    int kbs = k*bs, bbs = blockIdx.x * bs; 
+
+    shared_block_ij[tidy][threadIdx.x] = dist1[x_shift_i + bbs + tidy_n + threadIdx.x];
+    shared_block_ij[tidy_32][threadIdx.x] = dist1[x_shift_i + bbs + tidy_n_32 + threadIdx.x];
+    shared_block_ij[tidy][tidx_32] = dist1[x_shift_i + bbs + tidy_n + tidx_32];
+    
+    shared_block_ij[tidy_32][tidx_32] = dist1[x_shift_i + bbs + tidy_n_32 + tidx_32];
+
+    shared_block_ik[tidy][threadIdx.x] = dist1[x_shift_i + kbs + tidy_n + threadIdx.x];
+    shared_block_ik[tidy_32][threadIdx.x] = dist1[x_shift_i + kbs + tidy_n_32 + threadIdx.x];
+    shared_block_ik[tidy][tidx_32] = dist1[x_shift_i + kbs + tidy_n + tidx_32];
+    
+    shared_block_ik[tidy_32][tidx_32] = dist1[x_shift_i + kbs + tidy_n_32 + tidx_32];
+
+    shared_block_kj[tidy][threadIdx.x] = dist1[x_shift_k + bbs + tidy_n + threadIdx.x];
+    shared_block_kj[tidy_32][threadIdx.x] = dist1[x_shift_k + bbs + tidy_n_32 + threadIdx.x];
+    shared_block_kj[tidy][tidx_32] = dist1[x_shift_k + bbs + tidy_n + tidx_32];
+    
+    shared_block_kj[tidy_32][tidx_32] = dist1[x_shift_k + bbs + tidy_n_32 + tidx_32];
+
 
     __syncthreads();
-    block_calc(shared_block_ij,shared_block_ik,shared_block_kj,threadIdx.y,threadIdx.x);
-    // int tmp;
-    // for(int kk=0;kk<bs;kk++){
-    //     tmp = shared_block_ik[threadIdx.y*bs + kk] + shared_block_kj[kk*bs + threadIdx.x];  
-    //     if(tmp < shared_block_ij[threadIdx.y*bs + threadIdx.x])
-    //         shared_block_ij[threadIdx.y*bs + threadIdx.x] = tmp;
-    //     __syncthreads();
-    // }
-    __syncthreads();
-    dist1[x_shift_i + y_shift_j] = shared_block_ij[threadIdx.y * bs + threadIdx.x];
+
+    for(int kk=0;kk<bs;kk++){
+        shared_block_ij[tidy][threadIdx.x] = min(shared_block_ij[tidy][threadIdx.x], shared_block_ik[tidy][kk] + shared_block_kj[kk][threadIdx.x]);
+        shared_block_ij[tidy_32][threadIdx.x] = min(shared_block_ij[tidy_32][threadIdx.x], shared_block_ik[tidy_32][kk] + shared_block_kj[kk][threadIdx.x]);
+        shared_block_ij[tidy][tidx_32] = min(shared_block_ij[tidy][tidx_32], shared_block_ik[tidy][kk] + shared_block_kj[kk][tidx_32]);
+        
+        shared_block_ij[tidy_32][tidx_32] = min(shared_block_ij[tidy_32][tidx_32], shared_block_ik[tidy_32][kk] + shared_block_kj[kk][tidx_32]);
+    }
+
+    dist1[x_shift_i + bbs + tidy_n + threadIdx.x] = shared_block_ij[tidy][threadIdx.x];
+    dist1[x_shift_i + bbs + tidy_n_32 + threadIdx.x] = shared_block_ij[tidy_32][threadIdx.x];
+    dist1[x_shift_i + bbs + tidy_n + tidx_32] = shared_block_ij[tidy][tidx_32];
+    
+    dist1[x_shift_i + bbs + tidy_n_32 + tidx_32] = shared_block_ij[tidy_32][tidx_32];
+
+
 }
+
 
 int* readBinaryFile(char* filename, int& vertices, int& edges, int& pad_vertices) {
     FILE* file = fopen(filename, "rb");
@@ -238,6 +211,7 @@ int* readBinaryFile(char* filename, int& vertices, int& edges, int& pad_vertices
     else
         pad_vertices = vertices;
     int* dist = new int[pad_vertices*pad_vertices];
+    
     for (int i = 0; i < pad_vertices; ++i) {
         // dist[i] = (int*)malloc(vertices * sizeof(int));
         for (int j = 0; j < pad_vertices; ++j) {
@@ -268,8 +242,10 @@ void writeBinaryFile(char* FileName, int* dist, int n, int pad_n) {
  
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
-            if (dist[i*pad_n+j] >= INF) 
-                dist[i*pad_n+j] = INF;
+            // if (dist[i*pad_n+j] >= INF) 
+                // dist[i*pad_n+j] = INF;
+            dist[i*pad_n+j] = (dist[i*pad_n+j] >= INF) ? INF : dist[i*pad_n+j];
+
         }
         fwrite(dist+i*pad_n, sizeof(int), n, outfile); 
     }
@@ -285,24 +261,23 @@ int main(int argc, char* argv[]) {
     int num_vertices, num_edges, pad_vertices;
     int* dist = readBinaryFile(input_file, num_vertices, num_edges, pad_vertices);
     int* d_dist;
+    cudaHostRegister(dist, pad_vertices*pad_vertices*sizeof(int), cudaHostRegisterDefault);
     cudaMalloc((void**)&d_dist, pad_vertices * pad_vertices * sizeof(int));
     cudaMemcpy(d_dist, dist, pad_vertices * pad_vertices * sizeof(int), cudaMemcpyHostToDevice);
     
-    int round = pad_vertices/bs; //std::ceil((double)num_vertices / bs);
-    dim3 blockSize(bs, bs, 1);
+    int round = (pad_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    dim3 blockSize(32, 32, 1);
     dim3 gridSize( round, round, 1);
-    
-    const int blocks = (pad_vertices + bs - 1) / bs;
-    // dim3 block_dim(bs, bs, 1);
-    dim3 phase4_grid(blocks, blocks, 1);
 
-    for (int k = 0; k < blocks; k++) {
+    for (int k = 0; k < round; k++) {
+        // std::cout<<k<<std::endl;
         block_fw_p1_kernel<<<1, blockSize>>>(d_dist, k, pad_vertices);
+        // Phase1<<<1, blockSize>>>(d_dist,k,pad_vertices);
+        // Phase2<<<round, blockSize>>>(d_dist,k,pad_vertices);
+        // Phase3<<<gridSize, blockSize>>>(d_dist,k,pad_vertices);
         block_fw_p2_kernel<<<round, blockSize>>>(d_dist, k, pad_vertices);
         block_fw_p3_kernel<<<gridSize, blockSize>>>(d_dist, k, pad_vertices);
-        // floyd_warshall_block_kernel_phase1<<<1, blockSize>>>(pad_vertices, k, d_dist);
-        // floyd_warshall_block_kernel_phase2<<<blocks, blockSize>>>(pad_vertices, k, d_dist);
-        // floyd_warshall_block_kernel_phase3<<<phase4_grid, blockSize>>>(pad_vertices, k, d_dist);
+
 
     }
 
